@@ -50,7 +50,7 @@
 //!
 //! More examples can be found in [here].
 //!
-//! [here]: https://github.com/coral-xyz/anchor/tree/v0.30.1/client/example/src
+//! [here]: https://github.com/coral-xyz/anchor/tree/v0.31.1/client/example/src
 //!
 //! # Features
 //!
@@ -59,7 +59,7 @@
 //! The client is blocking by default. To enable asynchronous client, add `async` feature:
 //!
 //! ```toml
-//! anchor-client = { version = "0.30.1 ", features = ["async"] }
+//! anchor-client = { version = "0.31.1 ", features = ["async"] }
 //! ````
 //!
 //! ## `mock`
@@ -67,7 +67,7 @@
 //! This feature allows passing in a custom RPC client when creating program instances, which is
 //! useful for mocking RPC responses, e.g. via [`RpcClient::new_mock`].
 //!
-//! [`RpcClient::new_mock`]: https://docs.rs/solana-client/2.1.0/solana_client/rpc_client/struct.RpcClient.html#method.new_mock
+//! [`RpcClient::new_mock`]: https://docs.rs/solana-rpc-client/2.1.0/solana_rpc_client/rpc_client/struct.RpcClient.html#method.new_mock
 
 use anchor_lang::solana_program::program_error::ProgramError;
 use anchor_lang::solana_program::pubkey::Pubkey;
@@ -75,16 +75,16 @@ use anchor_lang::{AccountDeserialize, Discriminator, InstructionData, ToAccountM
 use futures::{Future, StreamExt};
 use regex::Regex;
 use solana_account_decoder::UiAccountEncoding;
-use solana_client::nonblocking::rpc_client::RpcClient as AsyncRpcClient;
-use solana_client::rpc_config::{
-    RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig,
-    RpcTransactionLogsConfig, RpcTransactionLogsFilter,
-};
-use solana_client::rpc_filter::{Memcmp, RpcFilterType};
-use solana_client::{
-    client_error::ClientError as SolanaClientError,
-    nonblocking::pubsub_client::{PubsubClient, PubsubClientError},
-    rpc_response::{Response as RpcResponse, RpcLogsResponse},
+use solana_pubsub_client::nonblocking::pubsub_client::{PubsubClient, PubsubClientError};
+use solana_rpc_client::nonblocking::rpc_client::RpcClient as AsyncRpcClient;
+use solana_rpc_client_api::{
+    client_error::Error as SolanaClientError,
+    config::{
+        RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig,
+        RpcTransactionLogsConfig, RpcTransactionLogsFilter,
+    },
+    filter::{Memcmp, RpcFilterType},
+    response::{Response as RpcResponse, RpcLogsResponse},
 };
 use solana_sdk::account::Account;
 use solana_sdk::commitment_config::CommitmentConfig;
@@ -113,7 +113,6 @@ pub use cluster::Cluster;
 #[cfg(feature = "async")]
 pub use nonblocking::ThreadSafeSigner;
 pub use solana_account_decoder;
-pub use solana_client;
 pub use solana_sdk;
 
 mod cluster;
@@ -262,7 +261,8 @@ impl<C: Deref<Target = impl Signer> + Clone> Program<C> {
         let account = self
             .internal_rpc_client
             .get_account_with_commitment(&address, CommitmentConfig::processed())
-            .await?
+            .await
+            .map_err(Box::new)?
             .value
             .ok_or(ClientError::AccountNotFound)?;
         let mut data: &[u8] = &account.data;
@@ -288,7 +288,8 @@ impl<C: Deref<Target = impl Signer> + Clone> Program<C> {
             inner: self
                 .internal_rpc_client
                 .get_program_accounts_with_config(&self.id(), config)
-                .await?
+                .await
+                .map_err(Box::new)?
                 .into_iter()
                 .map(|(key, account)| {
                     Ok((key, T::try_deserialize(&mut (&account.data as &[u8]))?))
@@ -301,7 +302,9 @@ impl<C: Deref<Target = impl Signer> + Clone> Program<C> {
         let mut client = lock.write().await;
 
         if client.is_none() {
-            let sub_client = PubsubClient::new(self.cfg.cluster.ws_url()).await?;
+            let sub_client = PubsubClient::new(self.cfg.cluster.ws_url())
+                .await
+                .map_err(Box::new)?;
             *client = Some(sub_client);
         }
 
@@ -330,14 +333,18 @@ impl<C: Deref<Target = impl Signer> + Clone> Program<C> {
 
         let handle = tokio::spawn(async move {
             if let Some(ref client) = *lock.read().await {
-                let (mut notifications, unsubscribe) =
-                    client.logs_subscribe(filter, config).await?;
+                let (mut notifications, unsubscribe) = client
+                    .logs_subscribe(filter, config)
+                    .await
+                    .map_err(Box::new)?;
 
                 tx.send(unsubscribe).map_err(|e| {
-                    ClientError::SolanaClientPubsubError(PubsubClientError::RequestFailed {
-                        message: "Unsubscribe failed".to_string(),
-                        reason: e.to_string(),
-                    })
+                    ClientError::SolanaClientPubsubError(Box::new(
+                        PubsubClientError::RequestFailed {
+                            message: "Unsubscribe failed".to_string(),
+                            reason: e.to_string(),
+                        },
+                    ))
                 })?;
 
                 while let Some(logs) = notifications.next().await {
@@ -423,7 +430,7 @@ pub fn handle_system_log(this_program_str: &str, log: &str) -> (Option<String>, 
     } else if log.contains("invoke") && !log.ends_with("[1]") {
         (Some("cpi".to_string()), false) // Any string will do.
     } else {
-        let re = Regex::new(r"^Program (.*) success*$").unwrap();
+        let re = Regex::new(r"^Program ([1-9A-HJ-NP-Za-km-z]+) success$").unwrap();
         if re.is_match(log) {
             (None, true)
         } else {
@@ -441,7 +448,7 @@ impl Execution {
         let l = &logs[0];
         *logs = &logs[1..];
 
-        let re = Regex::new(r"^Program (.*) invoke.*$").unwrap();
+        let re = Regex::new(r"^Program ([1-9A-HJ-NP-Za-km-z]+) invoke \[[\d]+\]$").unwrap();
         let c = re
             .captures(l)
             .ok_or_else(|| ClientError::LogParseError(l.to_string()))?;
@@ -485,9 +492,9 @@ pub enum ClientError {
     #[error("{0}")]
     ProgramError(#[from] ProgramError),
     #[error("{0}")]
-    SolanaClientError(#[from] SolanaClientError),
+    SolanaClientError(#[from] Box<SolanaClientError>),
     #[error("{0}")]
-    SolanaClientPubsubError(#[from] PubsubClientError),
+    SolanaClientPubsubError(#[from] Box<PubsubClientError>),
     #[error("Unable to parse log: {0}")]
     LogParseError(String),
     #[error(transparent)]
@@ -635,27 +642,39 @@ impl<C: Deref<Target = impl Signer> + Clone, S: AsSigner> RequestBuilder<'_, C, 
     }
 
     async fn signed_transaction_internal(&self) -> Result<Transaction, ClientError> {
-        let latest_hash = self.internal_rpc_client.get_latest_blockhash().await?;
+        let latest_hash = self
+            .internal_rpc_client
+            .get_latest_blockhash()
+            .await
+            .map_err(Box::new)?;
 
         let tx = self.signed_transaction_with_blockhash(latest_hash)?;
         Ok(tx)
     }
 
     async fn send_internal(&self) -> Result<Signature, ClientError> {
-        let latest_hash = self.internal_rpc_client.get_latest_blockhash().await?;
+        let latest_hash = self
+            .internal_rpc_client
+            .get_latest_blockhash()
+            .await
+            .map_err(Box::new)?;
         let tx = self.signed_transaction_with_blockhash(latest_hash)?;
 
         self.internal_rpc_client
             .send_and_confirm_transaction(&tx)
             .await
-            .map_err(Into::into)
+            .map_err(|e| Box::new(e).into())
     }
 
     async fn send_with_spinner_and_config_internal(
         &self,
         config: RpcSendTransactionConfig,
     ) -> Result<Signature, ClientError> {
-        let latest_hash = self.internal_rpc_client.get_latest_blockhash().await?;
+        let latest_hash = self
+            .internal_rpc_client
+            .get_latest_blockhash()
+            .await
+            .map_err(Box::new)?;
         let tx = self.signed_transaction_with_blockhash(latest_hash)?;
 
         self.internal_rpc_client
@@ -665,7 +684,7 @@ impl<C: Deref<Target = impl Signer> + Clone, S: AsSigner> RequestBuilder<'_, C, 
                 config,
             )
             .await
-            .map_err(Into::into)
+            .map_err(|e| Box::new(e).into())
     }
 }
 
@@ -679,7 +698,7 @@ fn parse_logs_response<T: anchor_lang::Event + anchor_lang::AnchorDeserialize>(
         if let Ok(mut execution) = Execution::new(&mut logs) {
             // Create a new peekable iterator so that we can peek at the next log whilst iterating
             let mut logs_iter = logs.iter().peekable();
-            let regex = Regex::new(r"^Program (.*) invoke.*$").unwrap();
+            let regex = Regex::new(r"^Program ([1-9A-HJ-NP-Za-km-z]+) invoke \[[\d]+\]$").unwrap();
 
             while let Some(l) = logs_iter.next() {
                 // Parse the log.
@@ -729,7 +748,7 @@ fn parse_logs_response<T: anchor_lang::Event + anchor_lang::AnchorDeserialize>(
 
 #[cfg(test)]
 mod tests {
-    use solana_client::rpc_response::RpcResponseContext;
+    use solana_rpc_client_api::response::RpcResponseContext;
 
     // Creating a mock struct that implements `anchor_lang::events`
     // for type inference in `test_logs`
@@ -850,6 +869,39 @@ mod tests {
         let logs: Vec<String> = logs.iter().map(|&l| l.to_string()).collect();
 
         let program_id_str = "VeryCoolProgram";
+
+        // No events returned here. Just ensuring that the function doesn't panic
+        // due an incorrectly emptied stack.
+        parse_logs_response::<MockEvent>(
+            RpcResponse {
+                context: RpcResponseContext::new(0),
+                value: RpcLogsResponse {
+                    signature: "".to_string(),
+                    err: None,
+                    logs: logs.to_vec(),
+                },
+            },
+            program_id_str,
+        )
+        .unwrap();
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_logs_response_fake_pop() -> Result<()> {
+        let logs = [
+            "Program fake111111111111111111111111111111111111112 invoke [1]",
+            "Program log: i logged success",
+            "Program log: i logged success",
+            "Program fake111111111111111111111111111111111111112 consumed 1411 of 200000 compute units",
+            "Program fake111111111111111111111111111111111111112 success"
+          ];
+
+        // Converting to Vec<String> as expected in `RpcLogsResponse`
+        let logs: Vec<String> = logs.iter().map(|&l| l.to_string()).collect();
+
+        let program_id_str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
         // No events returned here. Just ensuring that the function doesn't panic
         // due an incorrectly emptied stack.
